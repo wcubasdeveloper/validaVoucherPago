@@ -33,21 +33,28 @@ def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 def extract_amount_from_text(text):
-    """Extrae montos en soles del texto"""
+    """Extrae montos en soles del texto - optimizado para vouchers peruanos"""
+    text_original = text
     text = text.replace(',', '.')
     
-    patterns = [
-        r'monto\s*[:.]?\s*S?/?\s*(\d+\.?\d*)',
-        r'total\s*[:.]?\s*S?/?\s*(\d+\.?\d*)',
-        r'pago\s*[:.]?\s*S?/?\s*(\d+\.?\d*)',
-        r'S/?\s*(\d+\.?\d*)',
-        r'(\d+\.?\d*)\s*soles',
-        r'(\d+\.?\d*)\s*pen',
-        r'\b(\d{2,4}\.?\d{0,2})\b'
+    print(f"\n📄 Texto completo para análisis:\n{text}\n")
+    
+    amounts_priority = []  # Montos con contexto claro (S/, monto, total)
+    amounts_general = []   # Montos generales
+    
+    # PRIORIDAD 1: Patrones con contexto explícito de soles
+    priority_patterns = [
+        r'S/\s*(\d{1,5}(?:\.\d{1,2})?)',           # S/ 260.00
+        r'S/\.?\s*(\d{1,5}(?:\.\d{1,2})?)',         # S/260
+        r'monto\s*[:.]?\s*S?/?\s*(\d{1,5}(?:\.\d{1,2})?)',
+        r'total\s*[:.]?\s*S?/?\s*(\d{1,5}(?:\.\d{1,2})?)',
+        r'pago\s*[:.]?\s*S?/?\s*(\d{1,5}(?:\.\d{1,2})?)',
+        r'enviado\s*[:.]?\s*S?/?\s*(\d{1,5}(?:\.\d{1,2})?)',
+        r'importe\s*[:.]?\s*S?/?\s*(\d{1,5}(?:\.\d{1,2})?)',
+        r'(\d{1,5}(?:\.\d{1,2})?)\s*soles',
     ]
     
-    amounts = []
-    for pattern in patterns:
+    for pattern in priority_patterns:
         matches = re.findall(pattern, text, re.IGNORECASE)
         for match in matches:
             try:
@@ -55,15 +62,43 @@ def extract_amount_from_text(text):
                 if amount_str and amount_str.count('.') <= 1:
                     amount = float(amount_str)
                     if 1 <= amount <= 10000:
-                        amounts.append(amount)
-                        print(f"   Monto encontrado: S/ {amount} (patrón: {pattern})")
+                        amounts_priority.append(amount)
+                        print(f"   ⭐ Monto prioritario: S/ {amount} (patrón: {pattern})")
             except ValueError:
                 continue
     
-    if amounts:
-        amounts = list(set([round(a, 2) for a in amounts]))
+    # PRIORIDAD 2: Números grandes aislados (probablemente el monto principal)
+    # Buscar números >= 100 que estén solos o cerca de puntos decimales
+    general_patterns = [
+        r'\b(\d{3,5}(?:\.\d{1,2})?)\b',  # 100-99999
+        r'\b(\d{2,5}),(\d{2})\b',         # formato 260,00
+    ]
     
-    return amounts
+    for pattern in general_patterns:
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        for match in matches:
+            try:
+                if isinstance(match, tuple):
+                    amount_str = match[0] + '.' + match[1]
+                else:
+                    amount_str = str(match)
+                amount_str = re.sub(r'[^\d.]', '', amount_str)
+                if amount_str and amount_str.count('.') <= 1:
+                    amount = float(amount_str)
+                    # Excluir años (2020-2030) y números de operación largos
+                    if 10 <= amount <= 9999 and not (2020 <= amount <= 2030):
+                        amounts_general.append(amount)
+                        print(f"   📊 Monto general: S/ {amount}")
+            except ValueError:
+                continue
+    
+    # Combinar: priorizar los montos con contexto
+    all_amounts = amounts_priority if amounts_priority else amounts_general
+    
+    if all_amounts:
+        all_amounts = list(set([round(a, 2) for a in all_amounts]))
+    
+    return all_amounts
 
 @app.route('/health', methods=['GET'])
 def health():
