@@ -1,113 +1,149 @@
 import os
 import sys
 import re
-import subprocess
+import base64
 import numpy as np
 import cv2
+import requests as http_requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 app = Flask(__name__)
 CORS(app)
 
-# En Linux Tesseract se instala en /usr/bin/tesseract
+OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
+
 import pytesseract
 pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
 
-# Verificar que funciona
 try:
     version = pytesseract.get_tesseract_version()
     print(f"✅ Tesseract versión: {version}")
 except Exception as e:
-    print(f"❌ Error al inicializar Tesseract: {e}")
-    sys.exit(1)
+    print(f"⚠️ Tesseract no disponible: {e}")
 
 UPLOAD_FOLDER = 'uploads'
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'bmp'}
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp'}
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-def extract_amount_from_text(text):
-    """Extrae montos en soles del texto - optimizado para vouchers peruanos"""
-    text_original = text
-    text = text.replace(',', '.')
+def image_to_base64(image_bytes):
+    return base64.b64encode(image_bytes).decode('utf-8')
+
+def extract_with_openai_vision(image_bytes, monto_esperado):
+    if not OPENAI_API_KEY:
+        print("⚠️ No hay API key de OpenAI")
+        return None
     
-    print(f"\n📄 Texto completo para análisis:\n{text}\n")
-    
-    amounts_priority = []  # Montos con contexto claro (S/, monto, total)
-    amounts_general = []   # Montos generales
-    
-    # PRIORIDAD 1: Patrones con contexto explícito de soles
-    priority_patterns = [
-        r'S/\s*(\d{1,5}(?:\.\d{1,2})?)',           # S/ 260.00
-        r'S/\.?\s*(\d{1,5}(?:\.\d{1,2})?)',         # S/260
-        r'monto\s*[:.]?\s*S?/?\s*(\d{1,5}(?:\.\d{1,2})?)',
-        r'total\s*[:.]?\s*S?/?\s*(\d{1,5}(?:\.\d{1,2})?)',
-        r'pago\s*[:.]?\s*S?/?\s*(\d{1,5}(?:\.\d{1,2})?)',
-        r'enviado\s*[:.]?\s*S?/?\s*(\d{1,5}(?:\.\d{1,2})?)',
-        r'importe\s*[:.]?\s*S?/?\s*(\d{1,5}(?:\.\d{1,2})?)',
-        r'(\d{1,5}(?:\.\d{1,2})?)\s*soles',
-    ]
-    
-    for pattern in priority_patterns:
-        matches = re.findall(pattern, text, re.IGNORECASE)
-        for match in matches:
+    try:
+        img_base64 = image_to_base64(image_bytes)
+        
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {OPENAI_API_KEY}"
+        }
+        
+        payload = {
+            "model": "gpt-4o-mini",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"""Analiza este comprobante de pago peruano (Yape, Plin, BCP, etc).
+Extrae SOLO el monto principal pagado en soles.
+El monto esperado es S/ {monto_esperado}.
+
+Responde SOLO con JSON sin texto adicional:
+{{"monto": 260.00, "descripcion": "Plin envio exitoso"}}
+
+Si no identificas el monto:
+{{"monto": null, "descripcion": "No se pudo leer"}}"""
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{img_base64}",
+                                "detail": "high"
+                            }
+                        }
+                    ]
+                }
+            ],
+            "max_tokens": 100
+        }
+        
+        response = http_requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            content = response.json()['choices'][0]['message']['content'].strip()
+            content = content.replace('```json', '').replace('```', '').strip()
+            print(f"🤖 OpenAI Vision: {content}")
+            import json
+            return json.loads(content)
+        else:
+            print(f"⚠️ Error OpenAI: {response.status_code}")
+            return None
+            
+    except Exception as e:
+        print(f"⚠️ Error OpenAI Vision: {e}")
+        return None
+
+def extract_with_tesseract(image_bytes):
+    try:
+        file_bytes = np.frombuffer(image_bytes, np.uint8)
+        image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+        if image is None:
+            return []
+        
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        scale = 2
+        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        gray = cv2.equalizeHist(gray)
+        binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+        
+        textos = []
+        for lang, config in [('spa', '--psm 3'), ('spa', '--psm 6'), ('eng', '--psm 3')]:
             try:
-                amount_str = re.sub(r'[^\d.]', '', str(match))
-                if amount_str and amount_str.count('.') <= 1:
-                    amount = float(amount_str)
-                    if 1 <= amount <= 10000:
-                        amounts_priority.append(amount)
-                        print(f"   ⭐ Monto prioritario: S/ {amount} (patrón: {pattern})")
-            except ValueError:
-                continue
-    
-    # PRIORIDAD 2: Números grandes aislados (probablemente el monto principal)
-    # Buscar números >= 100 que estén solos o cerca de puntos decimales
-    general_patterns = [
-        r'\b(\d{3,5}(?:\.\d{1,2})?)\b',  # 100-99999
-        r'\b(\d{2,5}),(\d{2})\b',         # formato 260,00
-    ]
-    
-    for pattern in general_patterns:
-        matches = re.findall(pattern, text, re.IGNORECASE)
-        for match in matches:
-            try:
-                if isinstance(match, tuple):
-                    amount_str = match[0] + '.' + match[1]
-                else:
-                    amount_str = str(match)
-                amount_str = re.sub(r'[^\d.]', '', amount_str)
-                if amount_str and amount_str.count('.') <= 1:
-                    amount = float(amount_str)
-                    # Excluir años (2020-2030) y números de operación largos
-                    if 10 <= amount <= 9999 and not (2020 <= amount <= 2030):
-                        amounts_general.append(amount)
-                        print(f"   📊 Monto general: S/ {amount}")
-            except ValueError:
-                continue
-    
-    # Combinar: priorizar los montos con contexto
-    all_amounts = amounts_priority if amounts_priority else amounts_general
-    
-    if all_amounts:
-        all_amounts = list(set([round(a, 2) for a in all_amounts]))
-    
-    return all_amounts
+                textos.append(pytesseract.image_to_string(binary, lang=lang, config=config))
+            except:
+                pass
+        
+        texto = '\n'.join(textos)
+        print(f"📝 Tesseract:\n{texto[:300]}")
+        
+        amounts = []
+        for pattern in [r'S/\s*(\d{1,5}(?:[.,]\d{1,2})?)', r'monto\s*[:.]?\s*S?/?\s*(\d{1,5}(?:[.,]\d{1,2})?)', r'total\s*[:.]?\s*S?/?\s*(\d{1,5}(?:[.,]\d{1,2})?)']:
+            for match in re.findall(pattern, texto, re.IGNORECASE):
+                try:
+                    a = float(str(match).replace(',', '.').replace(' ', ''))
+                    if 10 <= a <= 9999 and not (2020 <= a <= 2030):
+                        amounts.append(round(a, 2))
+                except:
+                    pass
+        
+        return list(set(amounts))
+    except Exception as e:
+        print(f"❌ Tesseract error: {e}")
+        return []
 
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({
         "status": "healthy",
-        "tesseract": {
-            "path": pytesseract.pytesseract.tesseract_cmd,
-            "version": str(pytesseract.get_tesseract_version()),
-        }
+        "tesseract": str(pytesseract.get_tesseract_version()),
+        "openai_vision": "enabled" if OPENAI_API_KEY else "disabled"
     })
 
 @app.route('/validar-pago', methods=['POST'])
@@ -115,103 +151,50 @@ def validar_pago():
     try:
         monto_esperado = request.form.get('monto_esperado')
         if not monto_esperado:
-            return jsonify({"error": "Falta el parámetro 'monto_esperado'", "valido": False}), 400
+            return jsonify({"error": "Falta monto_esperado", "valido": False}), 400
         
         monto_esperado = float(monto_esperado)
         print(f"\n💰 Monto esperado: S/ {monto_esperado}")
         
         if 'imagen' not in request.files:
-            return jsonify({"error": "No se recibió imagen", "valido": False}), 400
+            return jsonify({"error": "No imagen", "valido": False}), 400
         
         file = request.files['imagen']
-        if not file or file.filename == '':
-            return jsonify({"error": "Archivo vacío", "valido": False}), 400
+        if not file or not allowed_file(file.filename):
+            return jsonify({"error": "Archivo inválido", "valido": False}), 400
         
-        if not allowed_file(file.filename):
-            return jsonify({"error": "Tipo de archivo no permitido", "valido": False}), 400
-        
-        print(f"📸 Procesando imagen: {file.filename}")
-        file_bytes = np.frombuffer(file.read(), np.uint8)
-        image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-        
-        if image is None:
-            return jsonify({"error": "No se pudo decodificar la imagen", "valido": False}), 400
-        
-        # Preprocesamiento
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        gray = cv2.equalizeHist(gray)
-        binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                       cv2.THRESH_BINARY, 11, 2)
-        
-        textos = []
-        
-        try:
-            texto1 = pytesseract.image_to_string(binary, lang='spa', config='--psm 3')
-            textos.append(texto1)
-            print("✅ OCR con español (psm 3) completado")
-        except Exception as e:
-            print(f"⚠️ Error con configuración 1: {e}")
-        
-        try:
-            texto2 = pytesseract.image_to_string(binary, lang='eng', config='--psm 6')
-            textos.append(texto2)
-            print("✅ OCR con inglés (psm 6) completado")
-        except Exception as e:
-            print(f"⚠️ Error con configuración 2: {e}")
-        
-        try:
-            texto3 = pytesseract.image_to_string(binary, config='--psm 3')
-            textos.append(texto3)
-            print("✅ OCR sin idioma específico completado")
-        except Exception as e:
-            print(f"⚠️ Error con configuración 3: {e}")
-        
-        texto_completo = '\n'.join(textos)
-        print(f"\n📝 Texto extraído:\n{texto_completo[:500]}")
-        
-        montos_encontrados = extract_amount_from_text(texto_completo)
-        print(f"\n💰 Montos encontrados: {montos_encontrados}")
-        
+        image_bytes = file.read()
         es_valido = False
         monto_pagado = None
         mensaje = ""
-        
-        if montos_encontrados:
-            monto_pagado = min(montos_encontrados, key=lambda x: abs(x - monto_esperado))
+
+        # MÉTODO 1: OpenAI Vision
+        if OPENAI_API_KEY:
+            resultado = extract_with_openai_vision(image_bytes, monto_esperado)
+            if resultado and resultado.get('monto') is not None:
+                monto_pagado = float(resultado['monto'])
+                diferencia = abs(monto_pagado - monto_esperado)
+                es_valido = diferencia <= 1.0
+                mensaje = f"✅ Válido: S/ {monto_pagado:.2f}" if es_valido else f"❌ Monto incorrecto: S/ {monto_pagado:.2f} (esperado S/ {monto_esperado:.2f})"
+                return jsonify({"valido": es_valido, "monto_esperado": monto_esperado, "monto_encontrado": monto_pagado, "mensaje": mensaje, "metodo": "OpenAI Vision"})
+
+        # MÉTODO 2: Tesseract fallback
+        montos = extract_with_tesseract(image_bytes)
+        if montos:
+            monto_pagado = min(montos, key=lambda x: abs(x - monto_esperado))
             diferencia = abs(monto_pagado - monto_esperado)
-            
-            if diferencia <= 0.50:
-                es_valido = True
-                mensaje = f"✅ Pago válido: S/ {monto_pagado:.2f} (esperado: S/ {monto_esperado:.2f})"
-            else:
-                mensaje = f"❌ Monto incorrecto: S/ {monto_pagado:.2f} (esperado: S/ {monto_esperado:.2f})"
+            es_valido = diferencia <= 0.50
+            mensaje = f"✅ Válido: S/ {monto_pagado:.2f}" if es_valido else f"❌ Incorrecto: S/ {monto_pagado:.2f} (esperado S/ {monto_esperado:.2f})"
         else:
-            mensaje = "❌ No se pudo identificar ningún monto en la imagen"
+            mensaje = "❌ No se pudo identificar el monto"
         
-        print(f"\n📊 Resultado: {mensaje}")
-        
-        return jsonify({
-            "valido": es_valido,
-            "monto_esperado": monto_esperado,
-            "monto_encontrado": monto_pagado,
-            "montos_detectados": montos_encontrados,
-            "mensaje": mensaje
-        })
+        return jsonify({"valido": es_valido, "monto_esperado": monto_esperado, "monto_encontrado": monto_pagado, "montos_detectados": montos, "mensaje": mensaje, "metodo": "Tesseract"})
     
     except Exception as e:
-        print(f"❌ Error inesperado: {e}")
         import traceback
         traceback.print_exc()
         return jsonify({"error": str(e), "valido": False}), 500
 
 if __name__ == '__main__':
-    print("\n" + "="*60)
-    print("🚀 SERVIDOR DE VALIDACIÓN DE PAGOS - LINUX")
-    print("="*60)
-    print("\n📡 Endpoints:")
-    print("   GET  /health")
-    print("   POST /validar-pago")
-    print("\n📍 Servidor corriendo en: http://0.0.0.0:5000")
-    print("="*60 + "\n")
-    
+    print(f"🚀 Servidor iniciado - OpenAI Vision: {'ACTIVO' if OPENAI_API_KEY else 'INACTIVO'}")
     app.run(debug=False, host='0.0.0.0', port=5000)
