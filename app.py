@@ -49,14 +49,19 @@ def extract_with_openai_vision(image_bytes, monto_esperado):
                     "content": [
                         {
                             "type": "text",
-                            "text": f"""Analiza este comprobante de pago peruano (Yape, Plin, BCP, transferencia, etc).
-Extrae SOLO el monto principal pagado en soles.
+                            "text": f"""Analiza este comprobante de pago peruano. Puede ser voucher digital (Yape, Plin, BCP) o voucher fisico impreso (Banco de la Nacion, agente bancario).
+
+Busca el monto pagado en soles. Puede aparecer como:
+- MONTO : S/ ****100.00 (con asteriscos, ignora los asteriscos)
+- S/ 260.00
+- Total: 200.00
+
 El monto esperado es S/ {monto_esperado}.
 
 Responde SOLO con JSON sin texto adicional:
-{{"monto": 260.00, "descripcion": "Plin envio exitoso"}}
+{{"monto": 100.00, "descripcion": "Deposito Banco Nacion"}}
 
-Si no identificas el monto:
+Si definitivamente no puedes identificar ningun monto:
 {{"monto": null, "descripcion": "No se pudo leer"}}"""
                         },
                         {
