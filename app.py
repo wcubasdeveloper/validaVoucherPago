@@ -140,18 +140,16 @@ def procesar_imagen(image_bytes, monto_esperado):
     if OPENAI_API_KEY:
         resultado = extract_with_openai_vision(image_bytes, monto_esperado)
         if resultado is not None:
-            # Verificar si es voucher válido
+            # Si no es voucher
             if not resultado.get('es_voucher', True):
-                return {"valido": False, "monto_esperado": monto_esperado, "monto_encontrado": None, "mensaje": "❌ La imagen no parece ser un comprobante de pago. Por favor envía una foto de tu voucher.", "metodo": "OpenAI Vision", "es_voucher": False}
+                return {"valido": False, "monto_esperado": monto_esperado, "monto_encontrado": None, "mensaje": "❌ La imagen no parece ser un comprobante de pago.", "metodo": "OpenAI Vision", "es_voucher": False}
             
             if resultado.get('monto') is not None:
                 monto_pagado = float(resultado['monto'])
-                diferencia = abs(monto_pagado - monto_esperado)
-                es_valido = diferencia <= 1.0
-                mensaje = f"✅ Válido: S/ {monto_pagado:.2f}" if es_valido else f"❌ Monto incorrecto: S/ {monto_pagado:.2f} (esperado S/ {monto_esperado:.2f})"
-                return {"valido": es_valido, "monto_esperado": monto_esperado, "monto_encontrado": monto_pagado, "mensaje": mensaje, "metodo": "OpenAI Vision", "es_voucher": True}
+                # valido = True si se pudo leer el monto (N8N decide si es suficiente)
+                return {"valido": True, "monto_esperado": monto_esperado, "monto_encontrado": monto_pagado, "mensaje": f"✅ Monto detectado: S/ {monto_pagado:.2f}", "metodo": "OpenAI Vision", "es_voucher": True}
             else:
-                return {"valido": False, "monto_esperado": monto_esperado, "monto_encontrado": None, "mensaje": "❌ No se pudo leer el monto del comprobante. Por favor envía una foto más clara.", "metodo": "OpenAI Vision", "es_voucher": True}
+                return {"valido": False, "monto_esperado": monto_esperado, "monto_encontrado": None, "mensaje": "❌ No se pudo leer el monto. Por favor envía una foto más clara.", "metodo": "OpenAI Vision", "es_voucher": True}
 
     # MÉTODO 2: Tesseract fallback
     montos = extract_with_tesseract(image_bytes)
