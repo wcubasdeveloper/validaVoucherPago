@@ -49,22 +49,23 @@ def extract_with_openai_vision(image_bytes, monto_esperado):
                     "content": [
                         {
                             "type": "text",
-                            "text": f"""Primero determina si esta imagen ES un comprobante/voucher de pago peruano (Yape, Plin, BCP, deposito bancario, transferencia, etc).
+                            "text": f"""Analiza esta imagen y responde SOLO con JSON.
 
-Si NO es un comprobante de pago (es una foto de persona, animal, paisaje, etc):
-{{"monto": null, "es_voucher": false, "descripcion": "La imagen no es un comprobante de pago"}}
+1. Si NO es un comprobante de pago (foto de persona, animal, paisaje, etc):
+{{"monto": null, "es_voucher": false, "descripcion": "No es voucher"}}
 
-Si SI es un comprobante, busca el monto en soles:
-- MONTO : S/ ****100.00 (asteriscos son normales, ignóralos)
-- S/ 260.00 o Total: 200.00
+2. Si ES un comprobante de pago peruano (Yape, Plin, BCP, deposito, transferencia, ticket agente):
+Extrae el monto en soles. Formatos posibles:
+- S/ 200.00 o S/200
+- MONTO: S/ ****200.00 (ignora asteriscos, lee solo el numero)
+- Total: 260.00
 
-El monto esperado es S/ {monto_esperado}.
+{{"monto": 200.00, "es_voucher": true, "descripcion": "Deposito Banco Nacion"}}
 
-Responde SOLO con JSON:
-{{"monto": 100.00, "es_voucher": true, "descripcion": "Deposito Banco Nacion"}}
+Si es voucher pero el monto es ilegible:
+{{"monto": null, "es_voucher": true, "descripcion": "Monto ilegible"}}
 
-Si es voucher pero no puedes leer el monto:
-{{"monto": null, "es_voucher": true, "descripcion": "No se pudo leer el monto"}}"""
+El monto de referencia es S/ {monto_esperado}. Responde SOLO el JSON."""
                         },
                         {
                             "type": "image_url",
