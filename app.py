@@ -49,20 +49,22 @@ def extract_with_openai_vision(image_bytes, monto_esperado):
                     "content": [
                         {
                             "type": "text",
-                            "text": f"""Analiza este comprobante de pago peruano. Puede ser voucher digital (Yape, Plin, BCP) o voucher fisico impreso (Banco de la Nacion, agente bancario).
+                            "text": f"""Primero determina si esta imagen ES un comprobante/voucher de pago peruano (Yape, Plin, BCP, deposito bancario, transferencia, etc).
 
-Busca el monto pagado en soles. Puede aparecer como:
-- MONTO : S/ ****100.00 (con asteriscos, ignora los asteriscos)
-- S/ 260.00
-- Total: 200.00
+Si NO es un comprobante de pago (es una foto de persona, animal, paisaje, etc):
+{{"monto": null, "es_voucher": false, "descripcion": "La imagen no es un comprobante de pago"}}
+
+Si SI es un comprobante, busca el monto en soles:
+- MONTO : S/ ****100.00 (asteriscos son normales, ignóralos)
+- S/ 260.00 o Total: 200.00
 
 El monto esperado es S/ {monto_esperado}.
 
-Responde SOLO con JSON sin texto adicional:
-{{"monto": 100.00, "descripcion": "Deposito Banco Nacion"}}
+Responde SOLO con JSON:
+{{"monto": 100.00, "es_voucher": true, "descripcion": "Deposito Banco Nacion"}}
 
-Si definitivamente no puedes identificar ningun monto:
-{{"monto": null, "descripcion": "No se pudo leer"}}"""
+Si es voucher pero no puedes leer el monto:
+{{"monto": null, "es_voucher": true, "descripcion": "No se pudo leer el monto"}}"""
                         },
                         {
                             "type": "image_url",
@@ -80,7 +82,7 @@ Si definitivamente no puedes identificar ningun monto:
             "https://api.openai.com/v1/chat/completions",
             headers=headers,
             json=payload,
-            timeout=30
+            timeout=15
         )
         if response.status_code == 200:
             content = response.json()['choices'][0]['message']['content'].strip()
@@ -136,12 +138,19 @@ def procesar_imagen(image_bytes, monto_esperado):
     # MÉTODO 1: OpenAI Vision
     if OPENAI_API_KEY:
         resultado = extract_with_openai_vision(image_bytes, monto_esperado)
-        if resultado and resultado.get('monto') is not None:
-            monto_pagado = float(resultado['monto'])
-            diferencia = abs(monto_pagado - monto_esperado)
-            es_valido = diferencia <= 1.0
-            mensaje = f"✅ Válido: S/ {monto_pagado:.2f}" if es_valido else f"❌ Monto incorrecto: S/ {monto_pagado:.2f} (esperado S/ {monto_esperado:.2f})"
-            return {"valido": es_valido, "monto_esperado": monto_esperado, "monto_encontrado": monto_pagado, "mensaje": mensaje, "metodo": "OpenAI Vision"}
+        if resultado is not None:
+            # Verificar si es voucher válido
+            if not resultado.get('es_voucher', True):
+                return {"valido": False, "monto_esperado": monto_esperado, "monto_encontrado": None, "mensaje": "❌ La imagen no parece ser un comprobante de pago. Por favor envía una foto de tu voucher.", "metodo": "OpenAI Vision", "es_voucher": False}
+            
+            if resultado.get('monto') is not None:
+                monto_pagado = float(resultado['monto'])
+                diferencia = abs(monto_pagado - monto_esperado)
+                es_valido = diferencia <= 1.0
+                mensaje = f"✅ Válido: S/ {monto_pagado:.2f}" if es_valido else f"❌ Monto incorrecto: S/ {monto_pagado:.2f} (esperado S/ {monto_esperado:.2f})"
+                return {"valido": es_valido, "monto_esperado": monto_esperado, "monto_encontrado": monto_pagado, "mensaje": mensaje, "metodo": "OpenAI Vision", "es_voucher": True}
+            else:
+                return {"valido": False, "monto_esperado": monto_esperado, "monto_encontrado": None, "mensaje": "❌ No se pudo leer el monto del comprobante. Por favor envía una foto más clara.", "metodo": "OpenAI Vision", "es_voucher": True}
 
     # MÉTODO 2: Tesseract fallback
     montos = extract_with_tesseract(image_bytes)
