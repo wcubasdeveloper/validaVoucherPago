@@ -32,22 +32,15 @@ ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp'}
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-def image_to_base64(image_bytes):
-    return base64.b64encode(image_bytes).decode('utf-8')
-
 def extract_with_openai_vision(image_bytes, monto_esperado):
     if not OPENAI_API_KEY:
-        print("⚠️ No hay API key de OpenAI")
         return None
-    
     try:
-        img_base64 = image_to_base64(image_bytes)
-        
+        img_base64 = base64.b64encode(image_bytes).decode('utf-8')
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {OPENAI_API_KEY}"
         }
-        
         payload = {
             "model": "gpt-4o-mini",
             "messages": [
@@ -56,7 +49,7 @@ def extract_with_openai_vision(image_bytes, monto_esperado):
                     "content": [
                         {
                             "type": "text",
-                            "text": f"""Analiza este comprobante de pago peruano (Yape, Plin, BCP, etc).
+                            "text": f"""Analiza este comprobante de pago peruano (Yape, Plin, BCP, transferencia, etc).
 Extrae SOLO el monto principal pagado en soles.
 El monto esperado es S/ {monto_esperado}.
 
@@ -78,14 +71,12 @@ Si no identificas el monto:
             ],
             "max_tokens": 100
         }
-        
         response = http_requests.post(
             "https://api.openai.com/v1/chat/completions",
             headers=headers,
             json=payload,
             timeout=30
         )
-        
         if response.status_code == 200:
             content = response.json()['choices'][0]['message']['content'].strip()
             content = content.replace('```json', '').replace('```', '').strip()
@@ -93,9 +84,8 @@ Si no identificas el monto:
             import json
             return json.loads(content)
         else:
-            print(f"⚠️ Error OpenAI: {response.status_code}")
+            print(f"⚠️ Error OpenAI: {response.status_code} - {response.text}")
             return None
-            
     except Exception as e:
         print(f"⚠️ Error OpenAI Vision: {e}")
         return None
@@ -106,23 +96,18 @@ def extract_with_tesseract(image_bytes):
         image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
         if image is None:
             return []
-        
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         scale = 2
         gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
         gray = cv2.equalizeHist(gray)
         binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
-        
         textos = []
         for lang, config in [('spa', '--psm 3'), ('spa', '--psm 6'), ('eng', '--psm 3')]:
             try:
                 textos.append(pytesseract.image_to_string(binary, lang=lang, config=config))
             except:
                 pass
-        
         texto = '\n'.join(textos)
-        print(f"📝 Tesseract:\n{texto[:300]}")
-        
         amounts = []
         for pattern in [r'S/\s*(\d{1,5}(?:[.,]\d{1,2})?)', r'monto\s*[:.]?\s*S?/?\s*(\d{1,5}(?:[.,]\d{1,2})?)', r'total\s*[:.]?\s*S?/?\s*(\d{1,5}(?:[.,]\d{1,2})?)']:
             for match in re.findall(pattern, texto, re.IGNORECASE):
@@ -132,11 +117,38 @@ def extract_with_tesseract(image_bytes):
                         amounts.append(round(a, 2))
                 except:
                     pass
-        
         return list(set(amounts))
     except Exception as e:
         print(f"❌ Tesseract error: {e}")
         return []
+
+def procesar_imagen(image_bytes, monto_esperado):
+    """Procesa imagen y retorna resultado de validación"""
+    es_valido = False
+    monto_pagado = None
+    mensaje = ""
+
+    # MÉTODO 1: OpenAI Vision
+    if OPENAI_API_KEY:
+        resultado = extract_with_openai_vision(image_bytes, monto_esperado)
+        if resultado and resultado.get('monto') is not None:
+            monto_pagado = float(resultado['monto'])
+            diferencia = abs(monto_pagado - monto_esperado)
+            es_valido = diferencia <= 1.0
+            mensaje = f"✅ Válido: S/ {monto_pagado:.2f}" if es_valido else f"❌ Monto incorrecto: S/ {monto_pagado:.2f} (esperado S/ {monto_esperado:.2f})"
+            return {"valido": es_valido, "monto_esperado": monto_esperado, "monto_encontrado": monto_pagado, "mensaje": mensaje, "metodo": "OpenAI Vision"}
+
+    # MÉTODO 2: Tesseract fallback
+    montos = extract_with_tesseract(image_bytes)
+    if montos:
+        monto_pagado = min(montos, key=lambda x: abs(x - monto_esperado))
+        diferencia = abs(monto_pagado - monto_esperado)
+        es_valido = diferencia <= 0.50
+        mensaje = f"✅ Válido: S/ {monto_pagado:.2f}" if es_valido else f"❌ Incorrecto: S/ {monto_pagado:.2f} (esperado S/ {monto_esperado:.2f})"
+    else:
+        mensaje = "❌ No se pudo identificar el monto"
+
+    return {"valido": es_valido, "monto_esperado": monto_esperado, "monto_encontrado": monto_pagado, "montos_detectados": montos, "mensaje": mensaje, "metodo": "Tesseract"}
 
 @app.route('/health', methods=['GET'])
 def health():
@@ -148,6 +160,7 @@ def health():
 
 @app.route('/validar-pago', methods=['POST'])
 def validar_pago():
+    """Acepta imagen como archivo O como base64"""
     try:
         monto_esperado = request.form.get('monto_esperado')
         if not monto_esperado:
@@ -155,46 +168,41 @@ def validar_pago():
         
         monto_esperado = float(monto_esperado)
         print(f"\n💰 Monto esperado: S/ {monto_esperado}")
-        
-        if 'imagen' not in request.files:
-            return jsonify({"error": "No imagen", "valido": False}), 400
-        
-        file = request.files['imagen']
-        if not file or not allowed_file(file.filename):
-            return jsonify({"error": "Archivo inválido", "valido": False}), 400
-        
-        image_bytes = file.read()
-        es_valido = False
-        monto_pagado = None
-        mensaje = ""
 
-        # MÉTODO 1: OpenAI Vision
-        if OPENAI_API_KEY:
-            resultado = extract_with_openai_vision(image_bytes, monto_esperado)
-            if resultado and resultado.get('monto') is not None:
-                monto_pagado = float(resultado['monto'])
-                diferencia = abs(monto_pagado - monto_esperado)
-                es_valido = diferencia <= 1.0
-                mensaje = f"✅ Válido: S/ {monto_pagado:.2f}" if es_valido else f"❌ Monto incorrecto: S/ {monto_pagado:.2f} (esperado S/ {monto_esperado:.2f})"
-                return jsonify({"valido": es_valido, "monto_esperado": monto_esperado, "monto_encontrado": monto_pagado, "mensaje": mensaje, "metodo": "OpenAI Vision"})
+        image_bytes = None
 
-        # MÉTODO 2: Tesseract fallback
-        montos = extract_with_tesseract(image_bytes)
-        if montos:
-            monto_pagado = min(montos, key=lambda x: abs(x - monto_esperado))
-            diferencia = abs(monto_pagado - monto_esperado)
-            es_valido = diferencia <= 0.50
-            mensaje = f"✅ Válido: S/ {monto_pagado:.2f}" if es_valido else f"❌ Incorrecto: S/ {monto_pagado:.2f} (esperado S/ {monto_esperado:.2f})"
+        # OPCIÓN 1: imagen como base64
+        imagen_base64 = request.form.get('imagen_base64')
+        if imagen_base64:
+            try:
+                # Limpiar prefijo si existe (data:image/jpeg;base64,...)
+                if ',' in imagen_base64:
+                    imagen_base64 = imagen_base64.split(',')[1]
+                image_bytes = base64.b64decode(imagen_base64)
+                print(f"📸 Imagen recibida como base64 ({len(image_bytes)} bytes)")
+            except Exception as e:
+                return jsonify({"error": f"Base64 inválido: {e}", "valido": False}), 400
+
+        # OPCIÓN 2: imagen como archivo
+        elif 'imagen' in request.files:
+            file = request.files['imagen']
+            if file and allowed_file(file.filename):
+                image_bytes = file.read()
+                print(f"📸 Imagen recibida como archivo ({len(image_bytes)} bytes)")
+            else:
+                return jsonify({"error": "Archivo inválido", "valido": False}), 400
         else:
-            mensaje = "❌ No se pudo identificar el monto"
-        
-        return jsonify({"valido": es_valido, "monto_esperado": monto_esperado, "monto_encontrado": monto_pagado, "montos_detectados": montos, "mensaje": mensaje, "metodo": "Tesseract"})
-    
+            return jsonify({"error": "No se recibió imagen (usa 'imagen' o 'imagen_base64')", "valido": False}), 400
+
+        resultado = procesar_imagen(image_bytes, monto_esperado)
+        print(f"📊 {resultado['mensaje']}")
+        return jsonify(resultado)
+
     except Exception as e:
         import traceback
         traceback.print_exc()
         return jsonify({"error": str(e), "valido": False}), 500
 
 if __name__ == '__main__':
-    print(f"🚀 Servidor iniciado - OpenAI Vision: {'ACTIVO' if OPENAI_API_KEY else 'INACTIVO'}")
+    print(f"🚀 Servidor - OpenAI Vision: {'ACTIVO' if OPENAI_API_KEY else 'INACTIVO'}")
     app.run(debug=False, host='0.0.0.0', port=5000)
